@@ -155,6 +155,7 @@ func NewPlatformController(
 			}
 		},
 	})
+	// ponytail: ResourcePolicy events are the MVP trigger; add dependency watches if drift repair is needed.
 	resourcePolicyInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.enqueueResourcePolicy,
 		UpdateFunc: func(old, new interface{}) {
@@ -255,6 +256,7 @@ func (c *Controller) processNextWorkItem() bool {
 
 	if err != nil {
 		runtime.HandleError(err)
+		c.workqueue.AddRateLimited(obj)
 		return true
 	}
 
@@ -420,11 +422,12 @@ func (c *Controller) syncResourcePolicy(key string) error {
 	policy, err := c.resourcePoliciesLister.ResourcePolicies(namespace).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return nil
+			return c.deleteResourcePolicyNetworkPolicies(namespace, name)
 		}
 		return err
 	}
 
+	desiredPolicies := make(map[string]struct{}, len(policy.Spec.Policy.Network.Access))
 	for _, rule := range policy.Spec.Policy.Network.Access {
 		serviceNamespace := rule.ServiceRef.Namespace
 		if serviceNamespace == "" {
@@ -439,11 +442,40 @@ func (c *Controller) syncResourcePolicy(key string) error {
 		if err != nil {
 			return fmt.Errorf("build network policy for resource policy %s/%s: %w", namespace, name, err)
 		}
+		if desired.Annotations == nil {
+			desired.Annotations = map[string]string{}
+		}
+		desired.Annotations[networkPolicyResourcePolicyAnnotation] = namespace + "/" + name
 		if err := c.upsertNetworkPolicy(desired); err != nil {
 			return fmt.Errorf("apply network policy %s/%s: %w", desired.Namespace, desired.Name, err)
 		}
+		desiredPolicies[desired.Namespace+"/"+desired.Name] = struct{}{}
 	}
 
+	return c.pruneResourcePolicyNetworkPolicies(namespace+"/"+name, desiredPolicies)
+}
+
+func (c *Controller) deleteResourcePolicyNetworkPolicies(namespace, name string) error {
+	return c.pruneResourcePolicyNetworkPolicies(namespace+"/"+name, nil)
+}
+
+func (c *Controller) pruneResourcePolicyNetworkPolicies(resourcePolicyRef string, desired map[string]struct{}) error {
+	policies, err := c.kubeclientset.NetworkingV1().NetworkPolicies("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for i := range policies.Items {
+		policy := &policies.Items[i]
+		if policy.Labels[CREATED_BY_KEY] != CREATED_BY_VALUE || policy.Annotations[networkPolicyResourcePolicyAnnotation] != resourcePolicyRef {
+			continue
+		}
+		if _, ok := desired[policy.Namespace+"/"+policy.Name]; ok {
+			continue
+		}
+		if err := c.kubeclientset.NetworkingV1().NetworkPolicies(policy.Namespace).Delete(context.Background(), policy.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -459,6 +491,9 @@ func (c *Controller) upsertNetworkPolicy(desired *networkingv1.NetworkPolicy) er
 	}
 	if existing.Labels[CREATED_BY_KEY] != CREATED_BY_VALUE {
 		return fmt.Errorf("existing network policy is not managed by KubePlus")
+	}
+	if owner := existing.Annotations[networkPolicyResourcePolicyAnnotation]; owner != "" && owner != desired.Annotations[networkPolicyResourcePolicyAnnotation] {
+		return fmt.Errorf("existing network policy is owned by resource policy %q", owner)
 	}
 
 	desired.ResourceVersion = existing.ResourceVersion

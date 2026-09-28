@@ -14,12 +14,13 @@ import (
 )
 
 const (
-	networkPolicyProviderAnnotation = "kubeplus.io/provider-ref"
-	networkPolicyPartOfLabel        = "partof"
-	networkPolicyNamespaceLabel     = "kubernetes.io/metadata.name"
+	networkPolicyProviderAnnotation       = "kubeplus.io/provider-ref"
+	networkPolicyResourcePolicyAnnotation = "kubeplus.io/resource-policy-ref"
+	networkPolicyPartOfLabel              = "partof"
+	networkPolicyNamespaceLabel           = "kubernetes.io/metadata.name"
 )
 
-// builds one access rule; aggregate multiple rules when reconciliation is added.
+// builds one access rule.
 func buildNetworkPolicy(rule platformworkflowv1alpha1.NetworkAccessRule, service corev1.Service) (*networkingv1.NetworkPolicy, error) {
 	if rule.ProviderRef.Kind == "" || rule.ProviderRef.Name == "" {
 		return nil, fmt.Errorf("providerRef kind and name are required")

@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
@@ -108,6 +110,9 @@ func TestSyncResourcePolicyUpsertsNetworkPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if created.Annotations[networkPolicyResourcePolicyAnnotation] != "provider/rag-access" {
+		t.Fatalf("missing resource policy ownership annotation: %#v", created.Annotations)
+	}
 	if created.Spec.Ingress[0].Ports[0].Port.IntVal != 8080 {
 		t.Fatalf("unexpected created port: %d", created.Spec.Ingress[0].Ports[0].Port.IntVal)
 	}
@@ -125,5 +130,92 @@ func TestSyncResourcePolicyUpsertsNetworkPolicy(t *testing.T) {
 	}
 	if updated.Spec.Ingress[0].Ports[0].Port.IntVal != 9090 {
 		t.Fatalf("unexpected updated port: %d", updated.Spec.Ingress[0].Ports[0].Port.IntVal)
+	}
+}
+
+func TestSyncResourcePolicyPrunesRemovedNetworkPolicy(t *testing.T) {
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "rag-services", Name: "rag-api"},
+		Spec:       corev1.ServiceSpec{Selector: map[string]string{"partof": "ragservice-shared-rag"}},
+	}
+	policy := &platformworkflowv1alpha1.ResourcePolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "provider", Name: "rag-access"},
+		Spec: platformworkflowv1alpha1.ResourcePolicySpec{Policy: platformworkflowv1alpha1.Pol{
+			Network: platformworkflowv1alpha1.NetworkAccessPolicy{Access: []platformworkflowv1alpha1.NetworkAccessRule{{
+				Name:        "chatbot-to-rag",
+				ProviderRef: platformworkflowv1alpha1.ResourceReference{Kind: "RAGService", Name: "shared-rag"},
+				ServiceRef:  platformworkflowv1alpha1.ResourceReference{Kind: "Service", Namespace: "rag-services", Name: "rag-api"},
+				Consumers:   []platformworkflowv1alpha1.ResourceReference{{Kind: "Chatbot", Namespace: "team-a", Name: "chatbot"}},
+				Ports:       []platformworkflowv1alpha1.NetworkPort{{Protocol: "TCP", Port: 8080}},
+			}, {
+				Name:        "chatbot-to-rag-old",
+				ProviderRef: platformworkflowv1alpha1.ResourceReference{Kind: "RAGService", Name: "shared-rag"},
+				ServiceRef:  platformworkflowv1alpha1.ResourceReference{Kind: "Service", Namespace: "rag-services", Name: "rag-api"},
+				Consumers:   []platformworkflowv1alpha1.ResourceReference{{Kind: "Chatbot", Namespace: "team-a", Name: "chatbot"}},
+				Ports:       []platformworkflowv1alpha1.NetworkPort{{Protocol: "TCP", Port: 8080}},
+			}}},
+		}},
+	}
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	if err := indexer.Add(policy); err != nil {
+		t.Fatal(err)
+	}
+	controller := &Controller{
+		kubeclientset:          fake.NewSimpleClientset(service),
+		resourcePoliciesLister: platformlisters.NewResourcePolicyLister(indexer),
+	}
+	if err := controller.syncHandler(resourcePolicyQueuePrefix + "provider/rag-access"); err != nil {
+		t.Fatal(err)
+	}
+	oldName := "chatbot-to-rag-old"
+	updatedPolicy := policy.DeepCopy()
+	updatedPolicy.Spec.Policy.Network.Access = updatedPolicy.Spec.Policy.Network.Access[:1]
+	if err := indexer.Update(updatedPolicy); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.syncHandler(resourcePolicyQueuePrefix + "provider/rag-access"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.kubeclientset.NetworkingV1().NetworkPolicies("rag-services").Get(context.Background(), oldName, metav1.GetOptions{}); !errors.IsNotFound(err) {
+		t.Fatalf("expected removed rule policy to be deleted, got %v", err)
+	}
+}
+
+func TestSyncResourcePolicyDeleteCleansOwnedPoliciesOnly(t *testing.T) {
+	owned := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "rag-services", Name: "owned", Labels: map[string]string{CREATED_BY_KEY: CREATED_BY_VALUE},
+		Annotations: map[string]string{networkPolicyResourcePolicyAnnotation: "provider/rag-access"},
+	}}
+	other := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "rag-services", Name: "other", Labels: map[string]string{CREATED_BY_KEY: CREATED_BY_VALUE},
+		Annotations: map[string]string{networkPolicyResourcePolicyAnnotation: "provider/other"},
+	}}
+	controller := &Controller{
+		kubeclientset: fake.NewSimpleClientset(owned, other),
+		resourcePoliciesLister: platformlisters.NewResourcePolicyLister(
+			cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
+	}
+	if err := controller.syncHandler(resourcePolicyQueuePrefix + "provider/rag-access"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.kubeclientset.NetworkingV1().NetworkPolicies("rag-services").Get(context.Background(), "owned", metav1.GetOptions{}); !errors.IsNotFound(err) {
+		t.Fatalf("expected owned policy to be deleted, got %v", err)
+	}
+	if _, err := controller.kubeclientset.NetworkingV1().NetworkPolicies("rag-services").Get(context.Background(), "other", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected unrelated policy to remain, got %v", err)
+	}
+}
+
+func TestUpsertNetworkPolicyRejectsAnotherResourcePolicyOwner(t *testing.T) {
+	desired := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "rag-services", Name: "chatbot-to-rag",
+		Labels:      map[string]string{CREATED_BY_KEY: CREATED_BY_VALUE},
+		Annotations: map[string]string{networkPolicyResourcePolicyAnnotation: "provider/rag-access"},
+	}}
+	existing := desired.DeepCopy()
+	existing.Annotations[networkPolicyResourcePolicyAnnotation] = "provider/other"
+	controller := &Controller{kubeclientset: fake.NewSimpleClientset(existing)}
+	if err := controller.upsertNetworkPolicy(desired); err == nil {
+		t.Fatal("expected an ownership conflict")
 	}
 }
